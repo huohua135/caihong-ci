@@ -1,0 +1,197 @@
+name: Boot image (caihong)
+
+# One job from sources to a "fastboot boot"-able image: the 26-profile kernel,
+# the FAT payload that travels as the boot ramdisk, the UEFI firmware volume and
+# the Android boot image that wraps BootShim + FD + device tree. The firmware
+# and kernel workflows stay separate for the fast inner loops; this one is the
+# product the device consumes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_ref:
+        description: Device repository ref
+        required: true
+        default: ipados26
+      defconfig:
+        description: Defconfig name from configs/ of the device repository
+        required: true
+        default: caihong_ipados26_defconfig
+      chip_id:
+        description: Unique chip id handed to the ADT generator (hex)
+        required: true
+        default: "0x0000000077f9b32d"
+      edk2_target:
+        description: EDK II build target
+        type: choice
+        options:
+          - DEBUG
+          - RELEASE
+        default: DEBUG
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      UNIXNU_DEVICE: ${{ github.workspace }}/device
+      UNIXNU_TOOLCHAIN: ${{ github.workspace }}/.toolchain
+      DEFCONFIG: ${{ inputs.defconfig }}
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Check out UniXNU
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          path: unixnu
+          persist-credentials: false
+
+      - name: Check out the device repository
+        uses: actions/checkout@v4
+        with:
+          repository: huohua135/UniXNU-caihong
+          ref: ${{ inputs.device_ref }}
+          path: device
+          token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
+
+      - name: Check out the Mu-Silicium base
+        uses: actions/checkout@v4
+        with:
+          repository: huohua135/uefi-caihong
+          ref: sheng
+          path: uefi
+          submodules: recursive
+          token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Apply the device overlay
+        run: |
+          set -euxo pipefail
+          cp -r device/uefi-overlay/Platforms/. uefi/Platforms/
+          cp -r device/uefi-overlay/Resources/. uefi/Resources/
+          grep -E 'CaihongInitrdDxe|DarwinBoot' uefi/Platforms/OnePlus/caihongPkg/caihong.fdf
+          grep -E 'CaihongInitrdDxe|DarwinBoot' uefi/Platforms/OnePlus/caihongPkg/caihong.dsc
+          sed -i -E 's/#if[[:space:]]+ENABLE_SECUREBOOT[[:space:]]*==[[:space:]]*1/#if defined(ENABLE_SECUREBOOT) \&\& (ENABLE_SECUREBOOT)/' \
+            uefi/Silicon/Silicium/SiliciumPkg/Library/SecureBootHandlerLib/SecureBootHandler.c
+          grep -n 'ENABLE_SECUREBOOT' uefi/Silicon/Silicium/SiliciumPkg/Library/SecureBootHandlerLib/SecureBootHandler.c | head -5
+
+      - name: Wait for working DNS and apt mirrors
+        run: |
+          sudo sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
+          for attempt in $(seq 1 6); do
+            if getent hosts archive.ubuntu.com >/dev/null; then
+              sudo apt-get -o Acquire::Retries=10 update && exit 0
+              echo "apt update failed, retrying"
+            fi
+            sleep 10
+          done
+          echo "::error::apt mirrors unreachable"; exit 1
+
+      - name: Install the host tools
+        run: |
+          sudo apt-get install -y --no-install-recommends clang lld llvm cmake ninja-build python3 \
+            python3-pip uuid-dev libssl-dev device-tree-compiler mtools build-essential
+          for v in 22 21 20 19 18; do
+            if [ -x "/usr/bin/llvm-objcopy-$v" ] && ! command -v llvm-objcopy >/dev/null; then
+              sudo ln -sf "/usr/bin/llvm-objcopy-$v" /usr/local/bin/llvm-objcopy
+            fi
+          done
+          command -v llvm-objcopy
+
+      - name: Cache the UniXNU host toolchain
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.toolchain
+          key: unixnu-toolchain-${{ runner.os }}-v2-${{ hashFiles('unixnu/scripts/linux/setup-toolchain.py', 'unixnu/scripts/linux/*.patch') }}
+
+      - name: Install the Linux toolchain
+        id: toolchain-install
+        run: |
+          python3 unixnu/scripts/linux/setup-toolchain.py --print-packages
+          for attempt in $(seq 1 3); do
+            if sudo -E python3 unixnu/scripts/linux/setup-toolchain.py "$UNIXNU_TOOLCHAIN"; then
+              echo "toolchain installed on attempt $attempt"; exit 0
+            fi
+            sudo apt-get -o Acquire::Retries=10 update || true
+            sleep 30
+          done
+          echo "::error::toolchain install failed"; exit 1
+
+      - name: Save the UniXNU host toolchain
+        if: always() && steps.toolchain-install.outcome == 'success' && steps.toolchain-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.toolchain
+          key: unixnu-toolchain-${{ runner.os }}-v2-${{ hashFiles('unixnu/scripts/linux/setup-toolchain.py', 'unixnu/scripts/linux/*.patch') }}
+
+      - name: Resolve the device configuration
+        working-directory: unixnu
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          from unixnu.cli import parser, cmd_defconfig
+          from unixnu.config import Context
+          ctx = Context(parser().parse_args(['defconfig', os.environ['DEFCONFIG'], '-D', '../device']))
+          cmd_defconfig(ctx)
+          print('board:', ctx.board['board']['name'], '| work:', ctx.work)
+          PY
+
+      - name: Build the kernel
+        working-directory: unixnu
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./unixnu fetch
+          ./unixnu status --json
+          ./unixnu build kernel
+
+      - name: Build the payload
+        working-directory: unixnu
+        run: ./unixnu build payload --unique-chip-id "${{ inputs.chip_id }}"
+
+      - name: Build the firmware
+        working-directory: unixnu
+        run: |
+          set -o pipefail
+          ./unixnu build firmware --uefi ../uefi --edk2 ../uefi/Mu_Basecore --target ${{ inputs.edk2_target }} 2>&1 | tail -n 200
+
+      - name: Pack the boot image
+        working-directory: unixnu
+        run: |
+          set -o pipefail
+          ./unixnu bootimg --uefi ../uefi --dtb ../uefi/Resources/DTBs/caihong.dtb \
+            --target ${{ inputs.edk2_target }} --output "$GITHUB_WORKSPACE/boot.img" 2>&1 | tail -n 60
+
+      - name: Show the products
+        if: always()
+        run: |
+          ls -l boot.img 2>/dev/null || true
+          ls -l unixnu/out/caihong/boot/ 2>/dev/null || true
+          sha256sum boot.img unixnu/out/caihong/boot/boot.json 2>/dev/null || true
+
+      - name: Upload the boot image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-caihong-${{ github.run_attempt }}
+          path: |
+            boot.img
+            unixnu/out/caihong/boot/boot.json
+            unixnu/out/caihong/payload/payload.json
+            unixnu/out/caihong/kernel/*.json
+            unixnu/out/caihong/logs/*.log
+          if-no-files-found: warn
+          retention-days: 14
