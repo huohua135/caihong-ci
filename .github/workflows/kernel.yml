@@ -93,6 +93,7 @@ jobs:
           PY
 
       - name: Cache the UniXNU host toolchain
+        id: toolchain-cache
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.toolchain
@@ -111,6 +112,7 @@ jobs:
           echo "::error::apt mirrors unreachable"; exit 1
 
       - name: Install the Linux toolchain
+        id: toolchain-install
         run: |
           python3 unixnu/scripts/linux/setup-toolchain.py --print-packages
           for attempt in $(seq 1 3); do
@@ -121,6 +123,17 @@ jobs:
             sleep 30
           done
           echo "::error::toolchain install failed"; exit 1
+
+      # actions/cache only saves from its post step when the job succeeds, and this
+      # job fails for reasons that have nothing to do with the toolchain, so every
+      # run so far rebuilt LLVM + cctools (~27 min). Save explicitly instead.
+      - name: Save the UniXNU host toolchain
+        if: always() && steps.toolchain-install.outcome == 'success' && steps.toolchain-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.toolchain
+          key: unixnu-toolchain-${{ runner.os }}-v2-${{ hashFiles('unixnu/scripts/linux/setup-toolchain.py', 'unixnu/scripts/linux/*.patch') }}
 
       - name: Build kernel
         id: kernel
