@@ -116,6 +116,7 @@ jobs:
           command -v llvm-objcopy
 
       - name: Cache the UniXNU host toolchain
+        if: inputs.payload == 'yes'
         id: toolchain-cache
         uses: actions/cache@v4
         with:
@@ -123,6 +124,7 @@ jobs:
           key: unixnu-toolchain-${{ runner.os }}-v2-${{ hashFiles('unixnu/scripts/linux/setup-toolchain.py', 'unixnu/scripts/linux/*.patch') }}
 
       - name: Install the Linux toolchain
+        if: inputs.payload == 'yes'
         id: toolchain-install
         run: |
           python3 unixnu/scripts/linux/setup-toolchain.py --print-packages
@@ -136,7 +138,7 @@ jobs:
           echo "::error::toolchain install failed"; exit 1
 
       - name: Save the UniXNU host toolchain
-        if: always() && steps.toolchain-install.outcome == 'success' && steps.toolchain-cache.outputs.cache-hit != 'true'
+        if: always() && inputs.payload == 'yes' && steps.toolchain-install.outcome == 'success' && steps.toolchain-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
