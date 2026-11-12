@@ -35,6 +35,10 @@ on:
           - "yes"
           - "no"
         default: "yes"
+      dtb_path:
+        description: Device tree handed to the boot image, relative to the workspace
+        required: true
+        default: uefi/Resources/DTBs/caihong.dtb
 
 permissions:
   contents: read
@@ -187,7 +191,8 @@ jobs:
           # the smoke image carries the firmware volume alone.
           ramdisk=()
           if [ "${{ inputs.payload }}" != "yes" ]; then ramdisk=(--ramdisk none); fi
-          ./unixnu bootimg --uefi ../uefi --dtb ../uefi/Resources/DTBs/caihong.dtb \
+          ls -l "$GITHUB_WORKSPACE/${{ inputs.dtb_path }}"
+          ./unixnu bootimg --uefi ../uefi --dtb "$GITHUB_WORKSPACE/${{ inputs.dtb_path }}" \
             --target ${{ inputs.edk2_target }} "${ramdisk[@]}" \
             --output "$GITHUB_WORKSPACE/boot.img" 2>&1 | tail -n 60
 
