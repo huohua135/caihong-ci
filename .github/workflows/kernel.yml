@@ -151,12 +151,32 @@ jobs:
         working-directory: unixnu
         run: ./unixnu build payload
 
+      - name: Inspect the native kernel and the linker flags
+        if: always()
+        working-directory: unixnu
+        run: |
+          K=out/caihong/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
+          {
+            echo "== arm64e linker flags in the assembled tree =="
+            grep -n -A6 'LDFLAGS_KERNEL_ONLY_SUBARCH_arm64e' out/caihong/tree/.cache/xnu-work/makedefs/MakeInc.def 2>&1 | head -20
+            echo
+            echo "== kernel file =="
+            ls -l "$K" 2>&1
+            echo
+            echo "== load commands =="
+            llvm-objdump --macho --private-headers "$K" 2>&1 | grep -E 'MH_|LC_SEGMENT|LC_DYLD|LC_MAIN|LC_UUID|cmd ' | head -40
+            echo
+            echo "== readobj header =="
+            llvm-readobj --file-headers --program-headers "$K" 2>&1 | head -40
+          } | tee "$GITHUB_WORKSPACE/inspect.txt"
+
       - name: Upload the build products
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: caihong-${{ inputs.defconfig }}-${{ github.run_attempt }}
           path: |
+            inspect.txt
             unixnu/out/*/kernel/kernel.macho
             unixnu/out/*/kernel/*.adt
             unixnu/out/*/kernel/*.json
