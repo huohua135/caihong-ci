@@ -19,6 +19,10 @@ on:
         description: Device repository ref
         required: true
         default: main
+      defconfig:
+        description: Defconfig name in configs/ of the device repository
+        required: true
+        default: caihong_defconfig
 
 permissions:
   contents: read
@@ -29,12 +33,15 @@ defaults:
 
 jobs:
   build:
-    # GitHub disabled Actions on huohua135/UniXNU (a fork), so this workflow lives in its own
-    # repository and checks the UniXNU tree out beside the device repository instead.
-    # The overlay FDF packs CaihongInitrdDxe, UniXNU, UniXNUDxe and DarwinBoot; the 2026-10-22
-    # fd-caihong artifact only carried the last two, which is why that image never lit the panel.
+    # Built through UniXNU's own firmware step (EDK II directly) instead of build_uefi.py:
+    # the stuart wrapper insists on fetching the mu_nasm NuGet package, which fails on the
+    # hosted Linux image. The overlay FDF packs CaihongInitrdDxe, UniXNU, UniXNUDxe and
+    # DarwinBoot; the 2026-10-22 fd-caihong artifact only carried the last two.
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    env:
+      UNIXNU_DEVICE: ${{ github.workspace }}/device
+      DEFCONFIG: ${{ inputs.defconfig }}
     steps:
       - name: Check out UniXNU
         uses: actions/checkout@v4
@@ -60,45 +67,65 @@ jobs:
           submodules: recursive
           token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Apply the device overlay
         run: |
           set -euxo pipefail
           cp -r device/uefi-overlay/Platforms/. uefi/Platforms/
           cp -r device/uefi-overlay/Resources/. uefi/Resources/
-          cp device/uefi-overlay/build_uefi.py uefi/build_uefi.py
-          cp device/uefi-overlay/UniXNU/package/UniXNUPkg/Library/UniXNULib/Main.c \
-             unixnu/package/UniXNUPkg/Library/UniXNULib/Main.c
-          rm -rf uefi/UniXNU
-          ln -sfn "$PWD/unixnu" uefi/UniXNU
           grep -E 'CaihongInitrdDxe|DarwinBoot' uefi/Platforms/OnePlus/caihongPkg/caihong.fdf
+          grep -E 'CaihongInitrdDxe|DarwinBoot' uefi/Platforms/OnePlus/caihongPkg/caihong.dsc
+
+      - name: Wait for working DNS and apt mirrors
+        run: |
+          sudo sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
+          for attempt in $(seq 1 6); do
+            if getent hosts archive.ubuntu.com >/dev/null; then
+              sudo apt-get -o Acquire::Retries=10 update && exit 0
+              echo "apt update failed, retrying"
+            fi
+            sleep 10
+          done
+          echo "::error::apt mirrors unreachable"; exit 1
 
       - name: Install the host tools
         run: |
-          sudo sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
-          sudo apt-get -o Acquire::Retries=10 update
-          # mu_nasm is delivered as a NuGet package and stuart needs Mono to unpack it on Linux
           sudo apt-get install -y --no-install-recommends clang lld llvm cmake ninja-build python3 \
-            python3-pip uuid-dev libssl-dev device-tree-compiler mtools build-essential mono-devel
+            python3-pip uuid-dev libssl-dev device-tree-compiler mtools build-essential
           for v in 22 21 20 19 18; do
             if [ -x "/usr/bin/llvm-objcopy-$v" ] && ! command -v llvm-objcopy >/dev/null; then
               sudo ln -sf "/usr/bin/llvm-objcopy-$v" /usr/local/bin/llvm-objcopy
             fi
           done
           command -v llvm-objcopy
-          python3 -m pip install --break-system-packages --no-input -r uefi/pip-requirements.txt
+
+      - name: Resolve the device configuration
+        working-directory: unixnu
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          from unixnu.cli import parser, cmd_defconfig
+          from unixnu.config import Context
+          ctx = Context(parser().parse_args(['defconfig', os.environ['DEFCONFIG'], '-D', '../device']))
+          cmd_defconfig(ctx)
+          print('work:', ctx.work)
+          PY
 
       - name: Build the firmware
-        working-directory: uefi
+        working-directory: unixnu
         run: |
           set -o pipefail
-          python3 build_uefi.py -d caihong -m 0 -r RELEASE 2>&1 | tail -n 300
+          ./unixnu build firmware --uefi ../uefi --edk2 ../uefi/Mu_Basecore 2>&1 | tail -n 200
 
       - name: Show the products
         if: always()
         run: |
-          ls -l uefi/Build/*/RELEASE_CLANGPDB/FV/* 2>/dev/null || true
-          ls -l uefi/Mu-*.img 2>/dev/null || true
-          sha256sum uefi/Build/*/RELEASE_CLANGPDB/FV/*.fd uefi/Mu-*.img uefi/BootShim/BootShim.bin 2>/dev/null || true
+          ls -l uefi/Build/caihongPkg/*/FV/* 2>/dev/null || true
+          sha256sum uefi/Build/caihongPkg/*/FV/*.fd uefi/BootShim/BootShim.bin 2>/dev/null || true
 
       - name: Upload the firmware
         if: always()
@@ -106,9 +133,8 @@ jobs:
         with:
           name: firmware-caihong-${{ github.run_attempt }}
           path: |
-            uefi/Build/*/RELEASE_CLANGPDB/FV/*.fd
-            uefi/Build/*/RELEASE_CLANGPDB/FV/*.gz
-            uefi/Mu-*.img
+            uefi/Build/caihongPkg/*/FV/*.fd
+            uefi/Build/caihongPkg/*/FV/*.gz
             uefi/BootShim/BootShim.bin
           if-no-files-found: warn
           retention-days: 14
