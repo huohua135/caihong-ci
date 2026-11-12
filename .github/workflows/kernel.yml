@@ -1,0 +1,158 @@
+name: Kernel build (caihong)
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_repository:
+        description: Device repository as owner/name
+        required: true
+        default: huohua135/UniXNU-caihong
+      device_ref:
+        description: Device repository ref
+        required: true
+        default: ipados26
+      defconfig:
+        description: Defconfig name from configs/ of the device repository
+        required: true
+        default: caihong_ipados26_defconfig
+      steps:
+        description: Steps to build
+        type: choice
+        options:
+          - kernel
+          - kernel payload
+          - kernel userdata payload
+        default: kernel
+      ipsw_url:
+        description: IPSW URL (empty uses board.toml)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    # GitHub disabled Actions on the huohua135/UniXNU fork, so the workflow lives here and
+    # checks the UniXNU tree out beside the device repository.
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      UNIXNU_DEVICE: ${{ github.workspace }}/device
+      UNIXNU_IPSW: ${{ inputs.ipsw_url }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      STEPS: ${{ inputs.steps }}
+      DEBIAN_FRONTEND: noninteractive
+      UNIXNU_TOOLCHAIN: ${{ github.workspace }}/.toolchain
+    steps:
+      - name: Check out UniXNU
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          path: unixnu
+          persist-credentials: false
+
+      - name: Check out the device repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.device_repository }}
+          ref: ${{ inputs.device_ref }}
+          path: device
+          token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the inputs
+        id: check
+        working-directory: unixnu
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [ -f ../device/board.toml ] || fail "the device repository has no board.toml"
+          [ -f "../device/configs/$DEFCONFIG" ] || fail "device/configs/$DEFCONFIG not found: $(cd ../device/configs 2>/dev/null && printf '%s ' *_defconfig)"
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          from unixnu.cli import parser, cmd_defconfig
+          from unixnu.config import Context
+          ctx = Context(parser().parse_args(['defconfig', os.environ['DEFCONFIG'], '-D', '../device']))
+          cmd_defconfig(ctx)
+          board = ctx.board
+          name = board.get('board', {}).get('name')
+          if not name:
+              sys.exit('::error::board.toml needs [board] name')
+          print('board:', name, '| work:', ctx.work)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'board={name}\n')
+              out.write(f'work={ctx.work}\n')
+          PY
+
+      - name: Cache the UniXNU host toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.toolchain
+          key: unixnu-toolchain-${{ runner.os }}-v2-${{ hashFiles('unixnu/scripts/linux/setup-toolchain.py', 'unixnu/scripts/linux/*.patch') }}
+
+      - name: Wait for working DNS and apt mirrors
+        run: |
+          sudo sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
+          for attempt in $(seq 1 6); do
+            if getent hosts archive.ubuntu.com >/dev/null; then
+              sudo apt-get -o Acquire::Retries=10 Update::=True update && exit 0 || true
+              sudo apt-get -o Acquire::Retries=10 update && exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::apt mirrors unreachable"; exit 1
+
+      - name: Install the Linux toolchain
+        run: |
+          python3 unixnu/scripts/linux/setup-toolchain.py --print-packages
+          for attempt in $(seq 1 3); do
+            if sudo -E python3 unixnu/scripts/linux/setup-toolchain.py "$UNIXNU_TOOLCHAIN"; then
+              echo "toolchain installed on attempt $attempt"; exit 0
+            fi
+            sudo apt-get -o Acquire::Retries=10 update || true
+            sleep 30
+          done
+          echo "::error::toolchain install failed"; exit 1
+
+      - name: Build kernel
+        id: kernel
+        working-directory: unixnu
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./unixnu fetch
+          ./unixnu status --json
+          ./unixnu build kernel
+
+      - name: Build payload
+        id: payload
+        if: contains(inputs.steps, 'payload')
+        working-directory: unixnu
+        run: ./unixnu build payload
+
+      - name: Upload the build products
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: caihong-${{ inputs.defconfig }}-${{ github.run_attempt }}
+          path: |
+            unixnu/out/*/kernel/kernel.macho
+            unixnu/out/*/kernel/*.adt
+            unixnu/out/*/kernel/*.json
+            unixnu/out/*/*/*/kernel/kernel.macho
+            unixnu/out/*/*/*/kernel/*.adt
+            unixnu/out/*/*/*/kernel/*.json
+            unixnu/out/*/payload/payload.img
+            unixnu/out/*/*/*/payload/payload.img
+            unixnu/out/*/logs/*.log
+            unixnu/out/*/*/*/logs/*.log
+          if-no-files-found: warn
+          retention-days: 14
