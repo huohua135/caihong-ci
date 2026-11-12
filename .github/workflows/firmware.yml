@@ -78,6 +78,11 @@ jobs:
           cp -r device/uefi-overlay/Resources/. uefi/Resources/
           grep -E 'CaihongInitrdDxe|DarwinBoot' uefi/Platforms/OnePlus/caihongPkg/caihong.fdf
           grep -E 'CaihongInitrdDxe|DarwinBoot' uefi/Platforms/OnePlus/caihongPkg/caihong.dsc
+          # EDK II hands ENABLE_SECUREBOOT to the C compiler as the token FALSE/TRUE; a bare
+          # "#if FALSE == 1" is an error with the hosted clang. Accept both spellings.
+          sed -i -E 's/#if[[:space:]]+ENABLE_SECUREBOOT[[:space:]]*==[[:space:]]*1/#if defined(ENABLE_SECUREBOOT) \&\& (ENABLE_SECUREBOOT)/' \
+            uefi/Silicon/Silicium/SiliciumPkg/Library/SecureBootHandlerLib/SecureBootHandler.c
+          grep -n 'ENABLE_SECUREBOOT' uefi/Silicon/Silicium/SiliciumPkg/Library/SecureBootHandlerLib/SecureBootHandler.c | head -5
 
       - name: Wait for working DNS and apt mirrors
         run: |
