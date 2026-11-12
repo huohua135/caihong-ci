@@ -48,6 +48,13 @@ jobs:
       STEPS: ${{ inputs.steps }}
       DEBIAN_FRONTEND: noninteractive
       UNIXNU_TOOLCHAIN: ${{ github.workspace }}/.toolchain
+      # The caihong board.toml is still format 1 (no schema_version), and the
+      # arm64e selection lives in the profile system that only format 2 reads
+      # (scripts/unixnu/kernel.py:74). Without this the 26-profile kernel links
+      # as plain arm64: run 43169509994 produced CpuSubType ARM64_ALL, no
+      # LC_SEGMENT_SPLIT_INFO, and emit_prelink stopped at
+      # "Native image has no split-segment relocation information".
+      UNIXNU_XNU_ARCH: arm64e
     steps:
       - name: Check out UniXNU
         uses: actions/checkout@v4
